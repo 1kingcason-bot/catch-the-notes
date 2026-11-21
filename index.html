@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Catch the Notes — a game starring you</title>
+<meta name="description" content="Catch the 🎵, grab the ⭐, dodge the 🚫. A browser arcade game starring your face.">
+<meta name="theme-color" content="#12102a">
+<meta property="og:title" content="Catch the Notes">
+<meta property="og:description" content="Catch the 🎵, grab the ⭐, dodge the 🚫. A browser arcade game starring your face.">
+<meta property="og:type" content="website">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #07060f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "Segoe UI", Arial, sans-serif;
+    color: #fff;
+    overflow: hidden;
+    user-select: none;
+  }
+  #wrap { text-align: center; }
+  canvas {
+    background: radial-gradient(ellipse at 50% 0%, #2a2050 0%, #12102a 55%, #07060f 100%);
+    border: 2px solid #4b3f8f;
+    border-radius: 8px;
+    box-shadow: 0 0 40px rgba(90, 70, 200, .35);
+    max-width: 96vw;
+    max-height: 90vh;
+    cursor: none;
+    touch-action: none;
+  }
+  #hint { font-size: 13px; color: #8f86c9; margin-top: 8px; }
+  #hint b { color: #7ce7ff; font-weight: 600; }
+  noscript { display: block; padding: 40px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="800" height="600"></canvas>
+  <div id="hint">
+    Move: <b>← →</b> / <b>A D</b> / mouse &nbsp;·&nbsp; <b>P</b> pause &nbsp;·&nbsp; <b>M</b> mute &nbsp;·&nbsp; <b>Enter</b> start
+  </div>
+  <noscript>This game needs JavaScript enabled to run.</noscript>
+</div>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+/* ============================== SFX ============================== */
+const Sfx = {
+  ctx: null,
+  muted: localStorage.getItem("ctnMuted") === "1",
+  ensure() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try { this.ctx = new AC(); } catch (e) { return null; }
+    }
+    if (this.ctx.state === "suspended") this.ctx.resume();
+    return this.ctx;
+  },
+  tone(freq, dur, opt) {
+    if (this.muted) return;
+    const ac = this.ensure();
+    if (!ac) return;
+    opt = opt || {};
+    const type = opt.type || "square";
+    const vol = opt.vol != null ? opt.vol : 0.12;
+    const delay = opt.delay || 0;
+    const endFreq = opt.endFreq || null;
+    const t0 = ac.currentTime + delay;
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (endFreq) osc.frequency.exponentialRampToValueAtTime(Math.max(1, endFreq), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g);
+    g.connect(ac.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.03);
+  },
+  note()   { this.tone(660, 0.07, { vol: 0.10 }); this.tone(990, 0.07, { vol: 0.07, delay: 0.055 }); },
+  gold()   { [784, 988, 1319].forEach((f, i) => this.tone(f, 0.10, { type: "triangle", vol: 0.12, delay: i * 0.06 })); },
+  hurt()   { this.tone(230, 0.35, { type: "sawtooth", vol: 0.15, endFreq: 55 }); },
+  level()  { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.12, { vol: 0.10, delay: i * 0.08 })); },
+  start()  { [392, 523, 659, 784].forEach((f, i) => this.tone(f, 0.10, { vol: 0.10, delay: i * 0.07 })); },
+  over()   { [523, 415, 311, 208].forEach((f, i) => this.tone(f, 0.26, { type: "triangle", vol: 0.14, delay: i * 0.17 })); },
+  toggleMute() {
+    this.muted = !this.muted;
+    localStorage.setItem("ctnMuted", this.muted ? "1" : "0");
+    if (!this.muted) this.tone(880, 0.08, { vol: 0.1 });
+  }
+};
+
+/* ============================== ASSETS ============================== */
+const face = new Image();
+face.src = "singer-photo.jpg";
+let faceReady = false;
+face.onload = () => { faceReady = true; };
+
+/* ============================== STATE ============================== */
+const ST = { MENU: 0, PLAY: 1, PAUSE: 2, OVER: 3 };
+let state = ST.MENU;
+
+const player = { x: W / 2, y: H - 70, r: 34, speed: 6.2 };
+let items = [], particles = [], floats = [];
+let score = 0, lives = 3, level = 1, caught = 0;
+let combo = 0, maxCombo = 0;
+let spawnTimer = 0, timeAlive = 0;
+let banner = null;               // { text, sub, life }
+let highScore = Number(localStorage.getItem("ctnHigh") || 0);
+let shake = 0;
+const keys = {};
+let mouseX = null;
+
+function multiplier() { return Math.min(5, 1 + Math.floor(combo / 5)); }
+
+/* ============================== INPUT ============================== */
+addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (["arrowleft", "arrowright", "arrowup", "arrowdown", " "].includes(k)) e.preventDefault();
+  keys[k] = true;
+  if (k === "m") { Sfx.toggleMute(); return; }
+  if (k === "p" || k === "escape") {
+    if (state === ST.PLAY) state = ST.PAUSE;
+    else if (state === ST.PAUSE) state = ST.PLAY;
+    return;
+  }
+  if (k === "enter" || k === " ") {
+    if (state === ST.MENU || state === ST.OVER) startGame();
+    else if (state === ST.PAUSE) state = ST.PLAY;
+  }
+  if (k === "r" && state === ST.OVER) startGame();
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+canvas.addEventListener("mousemove", e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - rect.left) * (W / rect.width);
+});
+canvas.addEventListener("mouseleave", () => { mouseX = null; });
+canvas.addEventListener("mousedown", () => {
+  if (state === ST.MENU || state === ST.OVER) startGame();
+  else if (state === ST.PAUSE) state = ST.PLAY;
+});
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault();
+  if (state === ST.MENU || state === ST.OVER) startGame();
+  else if (state === ST.PAUSE) state = ST.PLAY;
+}, { passive: false });
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.touches[0].clientX - rect.left) * (W / rect.width);
+}, { passive: false });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state === ST.PLAY) state = ST.PAUSE;
+});
+
+/* ============================== FLOW ============================== */
+function startGame() {
+  state = ST.PLAY;
+  items = []; particles = []; floats = [];
+  score = 0; lives = 3; level = 1; caught = 0;
+  combo = 0; maxCombo = 0;
+  spawnTimer = 0; timeAlive = 0; shake = 0;
+  banner = null;
+  player.x = W / 2;
+  mouseX = null;
+  Sfx.start();
+}
+
+function gameOver() {
+  state = ST.OVER;
+  Sfx.over();
+  if (score > highScore) {
+    highScore = score;
+    localStorage.setItem("ctnHigh", String(highScore));
+  }
+}
+
+/* ============================== SPAWNING ============================== */
+function spawnItem() {
+  const roll = Math.random();
+  let type;
+  if (roll < 0.10 + level * 0.01) type = "gold";
+  else if (roll < 0.35 + level * 0.03) type = "bad";
+  else type = "note";
+
+  const speedMul = 1 + (level - 1) * 0.18;
+  items.push({
+    x: 40 + Math.random() * (W - 80),
+    y: -30,
+    r: type === "gold" ? 20 : 18,
+    vy: (2.0 + Math.random() * 1.6) * speedMul,
+    vx: (Math.random() - 0.5) * 0.8,
+    type,
+    spin: Math.random() * Math.PI * 2
+  });
+}
+
+/* ============================== EFFECTS ============================== */
+function burst(x, y, color, n) {
+  n = n || 14;
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 1 + Math.random() * 4;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 30 + Math.random() * 20, color });
+  }
+}
+function floatText(x, y, text, color) {
+  floats.push({ x, y, text, color, life: 50 });
+}
+function showBanner(text, sub) {
+  banner = { text, sub: sub || "", life: 90 };
+}
+
+/* ============================== UPDATE ============================== */
+function update() {
+  if (state !== ST.PLAY) return;
+  timeAlive++;
+
+  // difficulty: time + catches
+  const newLevel = 1 + Math.floor(timeAlive / 720) + Math.floor(caught / 15);
+  if (newLevel > level) {
+    level = newLevel;
+    showBanner("LEVEL " + level, "the stage heats up");
+    Sfx.level();
+  }
+  shake = Math.max(0, shake - 1);
+  if (banner) { banner.life--; if (banner.life <= 0) banner = null; }
+
+  // movement
+  if (mouseX !== null) player.x += (mouseX - player.x) * 0.25;
+  let dir = 0;
+  if (keys["arrowleft"] || keys["a"]) dir -= 1;
+  if (keys["arrowright"] || keys["d"]) dir += 1;
+  if (dir !== 0) { player.x += dir * player.speed; mouseX = null; }
+  player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+
+  // spawn
+  spawnTimer--;
+  if (spawnTimer <= 0) {
+    spawnItem();
+    spawnTimer = Math.max(14, 46 - level * 3);
+  }
+
+  // items
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy;
+    it.x += it.vx;
+    it.spin += 0.05;
+    if (it.x < it.r || it.x > W - it.r) it.vx *= -1;
+
+    const dx = it.x - player.x, dy = it.y - player.y;
+    if (Math.hypot(dx, dy) < it.r + player.r * 0.85) {
+      items.splice(i, 1);
+      if (it.type === "bad") {
+        lives--;
+        combo = 0;
+        shake = 12;
+        burst(it.x, it.y, "#ff4d6a", 20);
+        floatText(it.x, it.y, "-1 LIFE", "#ff4d6a");
+        Sfx.hurt();
+        if (lives <= 0) gameOver();
+      } else {
+        const mult = multiplier();
+        const base = it.type === "gold" ? 50 : 10;
+        const gain = base * mult;
+        score += gain;
+        caught++;
+        combo++;
+        maxCombo = Math.max(maxCombo, combo);
+        if (it.type === "gold") {
+          burst(it.x, it.y, "#ffd34d", 22);
+          Sfx.gold();
+        } else {
+          burst(it.x, it.y, "#7ce7ff", 14);
+          Sfx.note();
+        }
+        floatText(it.x, it.y, "+" + gain + (mult > 1 ? "  x" + mult : ""),
+          it.type === "gold" ? "#ffd34d" : "#7ce7ff");
+      }
+      continue;
+    }
+    // missed a note -> combo resets (bad items escaping are fine)
+    if (it.y > H + 40) {
+      if (it.type !== "bad" && combo >= 5) floatText(it.x, H - 60, "combo lost", "#8f86c9");
+      if (it.type !== "bad") combo = 0;
+      items.splice(i, 1);
+    }
+  }
+
+  // particles / floats
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy; p.vy += 0.12; p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.y -= 1; f.life--;
+    if (f.life <= 0) floats.splice(i, 1);
+  }
+}
+
+/* ============================== DRAWING ============================== */
+function drawFace(x, y, r, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  const pulse = 1 + Math.sin(t / 20) * 0.05;
+  ctx.beginPath();
+  ctx.arc(0, 0, r * 1.22 * pulse, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(124, 231, 255, .18)";
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+  if (faceReady) ctx.drawImage(face, -r, -r, r * 2, r * 2);
+  else { ctx.fillStyle = "#333"; ctx.fillRect(-r, -r, r * 2, r * 2); }
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#fff";
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawItem(it) {
+  ctx.save();
+  ctx.translate(it.x, it.y);
+  ctx.rotate(Math.sin(it.spin) * 0.4);
+  ctx.font = (it.r * 2) + "px serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(it.type === "bad" ? "🚫" : (it.type === "gold" ? "⭐" : "🎵"), 0, 2);
+  ctx.restore();
+}
+
+function drawStage(t) {
+  for (let i = 0; i < 3; i++) {
+    const sx = W * (0.25 + i * 0.25);
+    const sway = Math.sin(t / 60 + i * 2) * 60;
+    const g = ctx.createLinearGradient(sx, 0, sx + sway, H);
+    g.addColorStop(0, "rgba(255,255,255,.10)");
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(sx - 14, 0);
+    ctx.lineTo(sx + 14, 0);
+    ctx.lineTo(sx + sway + 130, H);
+    ctx.lineTo(sx + sway - 130, H);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.fillStyle = "rgba(124,231,255,.25)";
+  ctx.fillRect(0, H - 3, W, 3);
+}
+
+function neonText(text, x, y, size, color, blur) {
+  ctx.save();
+  ctx.font = "bold " + size + "px 'Segoe UI', Arial";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = color;
+  ctx.shadowBlur = blur || 18;
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  ctx.font = "bold 24px 'Segoe UI', Arial";
+  ctx.fillStyle = "#fff";
+  ctx.fillText("SCORE " + score, 16, 14);
+
+  if (multiplier() > 1) {
+    ctx.font = "bold 16px 'Segoe UI', Arial";
+    ctx.fillStyle = "#7ce7ff";
+    ctx.fillText("COMBO " + combo + "  (x" + multiplier() + ")", 16, 44);
+  } else if (combo > 0) {
+    ctx.font = "14px 'Segoe UI', Arial";
+    ctx.fillStyle = "#8f86c9";
+    ctx.fillText("combo " + combo, 16, 44);
+  }
+
+  ctx.textAlign = "center";
+  ctx.font = "bold 24px 'Segoe UI', Arial";
+  ctx.fillStyle = "#ffd34d";
+  ctx.fillText("LEVEL " + level, W / 2, 14);
+
+  ctx.textAlign = "right";
+  ctx.font = "22px 'Segoe UI', Arial";
+  ctx.fillStyle = "#ff6b83";
+  ctx.fillText("❤️".repeat(Math.max(0, lives)), W - 16, 14);
+
+  ctx.font = "16px 'Segoe UI', Arial";
+  ctx.fillStyle = "#8f86c9";
+  ctx.fillText(Sfx.muted ? "🔇 M" : "🔊 M", W - 16, 44);
+
+  if (highScore > 0) {
+    ctx.textAlign = "left";
+    ctx.font = "14px 'Segoe UI', Arial";
+    ctx.fillStyle = "#8f86c9";
+    ctx.fillText("BEST " + highScore, 16, 70);
+  }
+}
+
+function drawBanner() {
+  if (!banner) return;
+  const a = Math.min(1, banner.life / 30);
+  ctx.save();
+  ctx.globalAlpha = a;
+  neonText(banner.text, W / 2, H / 2 - 40, 56, "#7ce7ff", 24);
+  if (banner.sub) {
+    ctx.font = "20px 'Segoe UI', Arial";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#c9c2f2";
+    ctx.fillText(banner.sub, W / 2, H / 2 + 8);
+  }
+  ctx.restore();
+}
+
+function drawTitleScreen(t) {
+  ctx.fillStyle = "rgba(7,6,15,.55)";
+  ctx.fillRect(0, 0, W, H);
+
+  neonText("CATCH THE NOTES", W / 2, 84, 58, "#7ce7ff", 26);
+  ctx.font = "italic 20px 'Segoe UI', Arial";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#c9c2f2";
+  ctx.fillText("a game starring YOU", W / 2, 128);
+
+  drawFace(W / 2, 250, 62, t);
+  ctx.font = "15px 'Segoe UI', Arial";
+  ctx.fillStyle = "#8f86c9";
+  ctx.fillText("— the headliner —", W / 2, 336);
+
+  ctx.font = "19px 'Segoe UI', Arial";
+  ctx.fillStyle = "#e6e2ff";
+  ctx.fillText("Catch 🎵  ·  +10      Grab ⭐  ·  +50      Dodge 🚫  ·  −1 life", W / 2, 384);
+  ctx.fillStyle = "#8f86c9";
+  ctx.font = "16px 'Segoe UI', Arial";
+  ctx.fillText("Chain catches for a combo multiplier up to x5 — miss a note and it resets", W / 2, 414);
+
+  if (Math.sin(Date.now() / 300) > -0.3) {
+    neonText("PRESS ENTER OR CLICK TO TAKE THE STAGE", W / 2, 478, 24, "#ffd34d", 14);
+  }
+
+  ctx.font = "14px 'Segoe UI', Arial";
+  ctx.fillStyle = "#8f86c9";
+  ctx.fillText("← → / A D / mouse to move  ·  P pause  ·  M mute", W / 2, 520);
+  if (highScore > 0) {
+    ctx.fillStyle = "#ffd34d";
+    ctx.fillText("★ Best score: " + highScore, W / 2, 548);
+  }
+  ctx.fillStyle = "#5b5490";
+  ctx.fillText("© 2026 Catch the Notes · Starring you", W / 2, 578);
+}
+
+function drawPauseScreen() {
+  ctx.fillStyle = "rgba(7,6,15,.72)";
+  ctx.fillRect(0, 0, W, H);
+  neonText("PAUSED", W / 2, H / 2 - 20, 56, "#7ce7ff", 22);
+  ctx.font = "20px 'Segoe UI', Arial";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#c9c2f2";
+  ctx.fillText("Press P, Enter or click to get back on stage", W / 2, H / 2 + 36);
+}
+
+function drawGameOverScreen() {
+  ctx.fillStyle = "rgba(7,6,15,.78)";
+  ctx.fillRect(0, 0, W, H);
+
+  neonText("SHOW'S OVER", W / 2, 150, 56, "#ff6b83", 22);
+
+  ctx.textAlign = "center";
+  ctx.font = "bold 40px 'Segoe UI', Arial";
+  ctx.fillStyle = "#ffd34d";
+  ctx.fillText(score + " points", W / 2, 236);
+
+  ctx.font = "20px 'Segoe UI', Arial";
+  ctx.fillStyle = "#c9c2f2";
+  ctx.fillText("Level " + level + "   ·   " + caught + " caught   ·   best combo x" + maxCombo, W / 2, 280);
+  ctx.fillStyle = "#8f86c9";
+  ctx.fillText("All-time best: " + highScore, W / 2, 314);
+
+  if (score > 0 && score >= highScore) {
+    neonText("🏆 NEW HIGH SCORE! 🏆", W / 2, 366, 30, "#ffd34d", 16);
+  }
+
+  if (Math.sin(Date.now() / 300) > -0.3) {
+    ctx.font = "bold 22px 'Segoe UI', Arial";
+    ctx.fillStyle = "#7ce7ff";
+    ctx.fillText("PRESS ENTER OR CLICK FOR AN ENCORE", W / 2, 440);
+  }
+  ctx.font = "15px 'Segoe UI', Arial";
+  ctx.fillStyle = "#5b5490";
+  ctx.fillText("© 2026 Catch the Notes · Starring you", W / 2, 560);
+}
+
+let t = 0;
+function draw() {
+  t++;
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+
+  ctx.clearRect(-20, -20, W + 40, H + 40);
+  drawStage(t);
+
+  items.forEach(drawItem);
+
+  const bob = state === ST.PLAY ? Math.sin(t / 14) * 3 : 0;
+  drawFace(player.x, player.y + bob, player.r, t);
+
+  particles.forEach(p => {
+    ctx.globalAlpha = Math.max(0, p.life / 40);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    ctx.globalAlpha = 1;
+  });
+  floats.forEach(f => {
+    ctx.globalAlpha = Math.max(0, f.life / 50);
+    ctx.textAlign = "center";
+    ctx.font = "bold 20px 'Segoe UI', Arial";
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.globalAlpha = 1;
+  });
+
+  ctx.restore();
+
+  if (shake > 6) {
+    ctx.fillStyle = "rgba(255,40,70," + ((shake - 6) / 40) + ")";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (state === ST.PLAY || state === ST.PAUSE) { drawHUD(); drawBanner(); }
+  if (state === ST.MENU) drawTitleScreen(t);
+  else if (state === ST.PAUSE) drawPauseScreen();
+  else if (state === ST.OVER) drawGameOverScreen();
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+
+/* ============================== PWA ============================== */
+if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
